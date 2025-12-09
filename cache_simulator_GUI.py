@@ -1,732 +1,764 @@
-#Codigo do desenvolvimento das atividades 2 e 4
+#Código do desenvolvimento das atividades 1 e 3
 
-# Importações necessárias
-import numpy as np
-import matplotlib.pyplot as plt
-import random
-from collections import deque
-import dearpygui.dearpygui as dpg
-import time, sys, os
-from datetime import datetime
-import math
-import threading 
-import platform 
+
+# Importações necessárias para funcionalidades diversas
+import numpy as np                      # Biblioteca para computação numérica
+import matplotlib.pyplot as plt        # Biblioteca para visualização gráfica
+import random                          # Biblioteca padrão para geração de números aleatórios
+from collections import deque          # Deque (fila dupla) para simulações de políticas de cache
+import io, base64                      # Para manipulação de fluxos de bytes e codificação
+from PIL import Image                  # Para manipulação de imagens
+from io import BytesIO                 # Para fluxo de bytes em memória
+import csv                             # Para leitura/escrita de arquivos CSV
+import dearpygui.dearpygui as dpg     # Biblioteca GUI para interface gráfica
+import time, sys, os                   # Utilitários do sistema e tempo
+from datetime import datetime          # Para manipulação de datas e horários
 
 # ------------------------------------------------------------------------------
-# 1. CLASSES E VARIÁVEIS GLOBAIS
-# ------------------------------------------------------------------------------
-
-# Redirecionador de saída (Faz o print ir para a caixa de texto)
+# Redirecionador de saída padrão (print) para uma tag do DearPyGUI
 class DPGRedirector:
     def __init__(self, tag):
         self.tag = tag
+        self.buffer = ""
+
     def write(self, text):
-        try:
-            if dpg.does_item_exist(self.tag):
-                current = dpg.get_value(self.tag) or ""
-                if len(current) > 10000: current = current[-5000:] # Buffer maior
-                dpg.set_value(self.tag, current + text)
-                # Scroll automático para o fim
-                dpg.set_y_scroll(self.tag, -1.0)
-        except: pass
-    def flush(self): pass
+        self.buffer += text
+        current_text = dpg.get_value(self.tag)
+        dpg.set_value(self.tag, current_text + text)
 
+    def flush(self):
+        pass  # Método necessário para compatibilidade com sys.stdout
+
+# Lista global para armazenar tags de séries de plotagem (caso visualizações sejam usadas)
 plot_series_tags = []
-algoritmo_escolhido = "FIFO"
-resultados = []
-
-# Estado da Animação
-anim_state = {
-    'running': False,
-    'speed': 0.1,
-    'last_update': 0,
-    'padrao': [],
-    'index': 0,
-    'wt_ram_writes': 0,
-    'wb_ram_writes': 0,
-    'wb_cache': {}, 
-    'wt_cache': set(),
-    'cache_size_blocks': 4,
-    'msg_wt': "",
-    'msg_wb': ""
-}
 
 # ------------------------------------------------------------------------------
-# 2. FUNÇÕES AUXILIARES
-# ------------------------------------------------------------------------------
-
-def play_sound_async(type_sound):
-    def _sound_worker():
-        try:
-            if platform.system() == "Windows":
-                import winsound
-                if type_sound == 'WT': winsound.Beep(2000, 30)
-                elif type_sound == 'WB': winsound.Beep(400, 150)
-        except: pass
-    threading.Thread(target=_sound_worker, daemon=True).start()
-
+# Verifica se um número é potência de 2 (útil para parâmetros de cache válidos)
 def is_power_of_two(x):
     return (x != 0) and ((x & (x - 1)) == 0)
 
+# ------------------------------------------------------------------------------
+# Gera um padrão de acessos à memória simulando comportamentos realistas
 def gerar_padrao_realista(acessos, memory_size, regioes_quentes, prob_temporal, prob_espacial, prob_quente, bloco_tamanho):
     padrao = []
     endereco_anterior = random.randint(0, memory_size - 1)
-    max_addr = memory_size - 1
     for _ in range(acessos):
         r = random.random()
-        if r < prob_temporal: endereco = endereco_anterior
+        if r < prob_temporal:
+            # Repetição do endereço anterior (localidade temporal)
+            endereco = endereco_anterior
         elif r < prob_temporal + prob_espacial:
-            endereco = max(0, min(max_addr, endereco_anterior + random.randint(-16, 16)))
+            # Acesso a um endereço próximo ao anterior (localidade espacial)
+            deslocamento = random.randint(-16, 16)
+            endereco = max(0, min(memory_size - 1, endereco_anterior + deslocamento))
         elif r < prob_temporal + prob_espacial + prob_quente:
-            endereco = min(max_addr, random.choice(regioes_quentes) + random.randint(0, 3))
-        else: endereco = random.randint(0, max_addr)
+            # Acesso a uma região quente
+            base = random.choice(regioes_quentes)
+            deslocamento = random.randint(0, 3)
+            endereco = min(memory_size - 1, base + deslocamento)
+        else:
+            # Acesso completamente aleatório
+            endereco = random.randint(0, memory_size - 1)
+
         padrao.append(endereco)
         endereco_anterior = endereco
+
     return padrao
 
-def gerar_padrao_com_rw(acessos, memory_size, prob_write=0.3):
-    regioes = [64, 1024, 8192, 32000]
-    raw_padrao = gerar_padrao_realista(acessos, memory_size, regioes, 0.3, 0.3, 0.3, 1)
-    padrao_final = []
-    for addr in raw_padrao:
-        is_write = random.random() < prob_write
-        padrao_final.append((addr, is_write))
-    return padrao_final
-
 # ------------------------------------------------------------------------------
-# 3. LÓGICA DE SIMULAÇÃO DE CACHE (CORE)
-# ------------------------------------------------------------------------------
+# Simulação de cache com política de substituição FIFO
+def simular_cache_FIFO(padrao_acesso, cache_lines, associatividade, bloco_tamanho):
+    num_conjuntos = cache_lines // associatividade
+    cache = [[] for _ in range(num_conjuntos)]  # Lista de conjuntos de cache
+    hits, misses = 0, 0
+    conjunto_log, hit_log = [], []
 
-def simular_cache_FIFO(padrao, cache_lines, assoc, b_size):
-    sets = max(1, cache_lines // assoc)
-    cache = [[] for _ in range(sets)]
-    hit_log = []
-    for addr in padrao:
-        blk = addr // b_size
-        idx = blk % sets
-        st = cache[idx]
-        if blk in st: hit_log.append(1)
-        else:
-            hit_log.append(0)
-            if len(st) < assoc: st.append(blk)
-            else: 
-                st.pop(0)
-                st.append(blk)
-    return [], hit_log
+    for endereco in padrao_acesso:
+        bloco = endereco // bloco_tamanho
+        conjunto = bloco % num_conjuntos
+        conjunto_atual = cache[conjunto]
 
-def simular_cache_LRU(padrao, cache_lines, assoc, b_size):
-    sets = max(1, cache_lines // assoc)
-    cache = [deque() for _ in range(sets)]
-    hit_log = []
-    for addr in padrao:
-        blk = addr // b_size
-        idx = blk % sets
-        st = cache[idx]
-        if blk in st:
+        if bloco in conjunto_atual:
+            hits += 1
             hit_log.append(1)
-            st.remove(blk)
-            st.append(blk)
         else:
+            misses += 1
             hit_log.append(0)
-            if len(st) >= assoc: st.popleft()
-            st.append(blk)
-    return [], hit_log
+            if len(conjunto_atual) < associatividade:
+                conjunto_atual.append(bloco)
+            else:
+                conjunto_atual.pop(0)  # Remove o mais antigo
+                conjunto_atual.append(bloco)
 
-def simular_cache_LFU(padrao, cache_lines, assoc, b_size):
-    sets = max(1, cache_lines // assoc)
-    cache = [{} for _ in range(sets)]
-    hit_log = []
-    for addr in padrao:
-        blk = addr // b_size
-        idx = blk % sets
-        st = cache[idx]
-        if blk in st:
+        conjunto_log.append(conjunto)
+
+    return conjunto_log, hit_log
+
+# ------------------------------------------------------------------------------
+# Simulação de cache com política de substituição LRU (Least Recently Used)
+def simular_cache_LRU(padrao_acesso, cache_lines, associatividade, bloco_tamanho):
+    num_conjuntos = cache_lines // associatividade
+    cache = [deque() for _ in range(num_conjuntos)]
+    hits, misses = 0, 0
+    conjunto_log, hit_log = [], []
+
+    for endereco in padrao_acesso:
+        bloco = endereco // bloco_tamanho
+        conjunto = bloco % num_conjuntos
+        conjunto_atual = cache[conjunto]
+
+        if bloco in conjunto_atual:
+            hits += 1
             hit_log.append(1)
-            st[blk] += 1
+            conjunto_atual.remove(bloco)      # Remove e reinsere no fim (mais recente)
+            conjunto_atual.append(bloco)
         else:
+            misses += 1
             hit_log.append(0)
-            if len(st) < assoc: st[blk] = 1
-            else:
-                rem = min(st, key=st.get)
-                del st[rem]
-                st[blk] = 1
-    return [], hit_log
+            if len(conjunto_atual) >= associatividade:
+                conjunto_atual.popleft()      # Remove o menos recentemente usado
+            conjunto_atual.append(bloco)
 
-def simular_cache_RANDOM(padrao, cache_lines, assoc, b_size):
-    sets = max(1, cache_lines // assoc)
-    cache = [[] for _ in range(sets)]
-    hit_log = []
-    for addr in padrao:
-        blk = addr // b_size
-        idx = blk % sets
-        st = cache[idx]
-        if blk in st: hit_log.append(1)
+        conjunto_log.append(conjunto)
+
+    return conjunto_log, hit_log
+
+# ------------------------------------------------------------------------------
+# Simulação de cache com política de substituição LFU (Least Frequently Used)
+def simular_cache_LFU(padrao_acesso, cache_lines, associatividade, bloco_tamanho):
+    num_conjuntos = cache_lines // associatividade
+    cache = [{} for _ in range(num_conjuntos)]  # Dict: bloco -> frequência
+    hits, misses = 0, 0
+    conjunto_log, hit_log = [], []
+
+    for endereco in padrao_acesso:
+        bloco = endereco // bloco_tamanho
+        conjunto = bloco % num_conjuntos
+        conjunto_atual = cache[conjunto]
+
+        if bloco in conjunto_atual:
+            hits += 1
+            hit_log.append(1)
+            conjunto_atual[bloco] += 1
         else:
+            misses += 1
             hit_log.append(0)
-            if len(st) < assoc: st.append(blk)
-            else: st[random.randint(0, assoc-1)] = blk
-    return [], hit_log
-
-def simulacao_monte_carlo(n_sim, acessos, mem, lines, assoc, reg, probs, b_size, algo):
-    res_taxas = []
-    
-    # Executa N simulações
-    for i in range(n_sim):
-        p = gerar_padrao_realista(acessos, mem, reg, *probs, b_size)
-        if algo=='FIFO': _, l = simular_cache_FIFO(p, lines, assoc, b_size)
-        elif algo=='LRU': _, l = simular_cache_LRU(p, lines, assoc, b_size)
-        elif algo=='LFU': _, l = simular_cache_LFU(p, lines, assoc, b_size)
-        else: _, l = simular_cache_RANDOM(p, lines, assoc, b_size)
-        
-        taxa = sum(l)/len(l) if l else 0
-        res_taxas.append(taxa)
-
-    media = np.mean(res_taxas)
-    desvio = np.std(res_taxas)
-    maximo = max(res_taxas)
-    minimo = min(res_taxas)
-
-    print(f"--- Resultados: {acessos} Acessos - Bloco de {b_size} ---")
-    print(f"Média da Taxa de Acerto: {media:.4f}")
-    print(f"Desvio Padrão: {desvio:.4f}")
-    print(f"Máximo: {maximo:.4f}, Mínimo: {minimo:.4f}")
-    print("-" * 30 + "\n")
-
-    return media
-
-# Simulação Multinível
-def simular_cache_multinivel_core(padrao, niveis_config, algoritmos):
-    n_niveis = len(niveis_config)
-    hits_por_nivel = [0] * n_niveis
-    misses_por_nivel = [0] * n_niveis
-    caches = []
-    for i in range(n_niveis):
-        cache_lines, associatividade, bloco_tamanho = niveis_config[i]
-        num_conjuntos = max(1, cache_lines // associatividade)
-        if algoritmos[i] == 'LFU': cache = [{} for _ in range(num_conjuntos)]
-        elif algoritmos[i] == 'LRU': cache = [deque() for _ in range(num_conjuntos)]
-        else: cache = [[] for _ in range(num_conjuntos)]
-        caches.append((cache, num_conjuntos, associatividade, bloco_tamanho, algoritmos[i]))
-    
-    for endereco in padrao:
-        dados_encontrados = False
-        for nivel in range(n_niveis):
-            cache, num_conjuntos, associatividade, bloco_tamanho, algoritmo = caches[nivel]
-            bloco = endereco // bloco_tamanho
-            conjunto = bloco % num_conjuntos
-            conjunto_atual = cache[conjunto]
-            is_hit = False
-            if algoritmo == 'LFU':
-                if bloco in conjunto_atual:
-                    conjunto_atual[bloco] += 1
-                    is_hit = True
-            elif algoritmo == 'LRU':
-                if bloco in conjunto_atual:
-                    conjunto_atual.remove(bloco)
-                    conjunto_atual.append(bloco)
-                    is_hit = True
-            else: 
-                if bloco in conjunto_atual: is_hit = True
-            if is_hit:
-                hits_por_nivel[nivel] += 1
-                dados_encontrados = True
-                break
+            if len(conjunto_atual) < associatividade:
+                conjunto_atual[bloco] = 1
             else:
-                misses_por_nivel[nivel] += 1
-        
-        if not dados_encontrados:
-            for nivel in range(n_niveis):
-                cache, num_conjuntos, associatividade, bloco_tamanho, algoritmo = caches[nivel]
-                bloco = endereco // bloco_tamanho
-                conjunto = bloco % num_conjuntos
-                conjunto_atual = cache[conjunto]
-                if algoritmo == 'LFU':
-                    if len(conjunto_atual) < associatividade: conjunto_atual[bloco] = 1
-                    else:
-                        del conjunto_atual[min(conjunto_atual, key=conjunto_atual.get)]
-                        conjunto_atual[bloco] = 1
-                elif algoritmo == 'LRU':
-                    if len(conjunto_atual) < associatividade: conjunto_atual.append(bloco)
-                    else:
-                        conjunto_atual.popleft()
-                        conjunto_atual.append(bloco)
-                elif algoritmo == 'FIFO':
-                    if len(conjunto_atual) < associatividade: conjunto_atual.append(bloco)
-                    else:
-                        conjunto_atual.pop(0)
-                        conjunto_atual.append(bloco)
-                else: 
-                    if len(conjunto_atual) < associatividade: conjunto_atual.append(bloco)
-                    else:
-                        conjunto_atual[random.randint(0, associatividade - 1)] = bloco
-    hit_rates = []
-    total_acessos = len(padrao)
-    if total_acessos > 0:
-        hit_rates.append(hits_por_nivel[0] / total_acessos)
-        for i in range(1, n_niveis):
-            acessos_nivel = misses_por_nivel[i-1]
-            hit_rates.append(hits_por_nivel[i] / acessos_nivel if acessos_nivel > 0 else 0.0)
-    else:
-        hit_rates = [0.0] * n_niveis
-    return hit_rates
+                bloco_remover = min(conjunto_atual, key=conjunto_atual.get)
+                del conjunto_atual[bloco_remover]
+                conjunto_atual[bloco] = 1
 
-def calcular_tempo_medio_acesso(hit_rates, tempos_acesso):
-    n_niveis = len(hit_rates)
-    t_nivel_seguinte = tempos_acesso[-1]
-    for i in range(n_niveis - 1, -1, -1):
-        hit_rate = hit_rates[i]
-        t_nivel_atual = tempos_acesso[i]
-        t_nivel_seguinte = hit_rate * t_nivel_atual + (1 - hit_rate) * t_nivel_seguinte
-    return t_nivel_seguinte
+        conjunto_log.append(conjunto)
 
-def simulacao_monte_carlo_multinivel_wrapper(n_sim, acessos, mem, niveis, algos, tempos, reg, probs, b_size):
-    hit_rates_total = [[] for _ in range(len(niveis))]
-    tempos_medios = []
-    for i in range(n_sim):
-        padrao = gerar_padrao_realista(acessos, mem, reg, *probs, b_size)
-        hit_rates = simular_cache_multinivel_core(padrao, niveis, algos)
-        for nivel, taxa in enumerate(hit_rates):
-            hit_rates_total[nivel].append(taxa)
-        tempos_medios.append(calcular_tempo_medio_acesso(hit_rates, tempos))
-    return [np.mean(taxas) for taxas in hit_rates_total], np.mean(tempos_medios)
+    return conjunto_log, hit_log
 
 # ------------------------------------------------------------------------------
-# 4. LÓGICA DA ANIMAÇÃO
+# Simulação de cache com política de substituição aleatória (RANDOM)
+def simular_cache_RANDOM(padrao_acesso, cache_lines, associatividade, bloco_tamanho):
+    num_conjuntos = cache_lines // associatividade
+    cache = [[] for _ in range(num_conjuntos)]
+    hits, misses = 0, 0
+    conjunto_log, hit_log = [], []
+
+    for endereco in padrao_acesso:
+        bloco = endereco // bloco_tamanho
+        conjunto = bloco % num_conjuntos
+        conjunto_atual = cache[conjunto]
+
+        if bloco in conjunto_atual:
+            hits += 1
+            hit_log.append(1)
+        else:
+            misses += 1
+            hit_log.append(0)
+            if len(conjunto_atual) < associatividade:
+                conjunto_atual.append(bloco)
+            else:
+                idx_remover = random.randint(0, associatividade - 1)
+                conjunto_atual[idx_remover] = bloco
+
+        conjunto_log.append(conjunto)
+
+    return conjunto_log, hit_log
+
+def atividade4_montecarlo():
+    print("\n\n=== ATIVIDADE 4 — Monte Carlo (100 execuções por algoritmo) ===")
+    print("Parâmetros fixados conforme solicitado na atividade.\n")
+
+    # Parâmetros fixos da atividade
+    memory_size = 4096
+    acessos = 5000
+    tamanho_cache = 8192
+    associatividade = 2
+    bloco_tamanho = 8
+    n_runs = 100
+
+    prob_temporal = 0.3
+    prob_espacial = 0.3
+    prob_quente = 0.4
+    regioes_quentes = [64, 512, 1024, 2048]
+
+    algos = {
+        'FIFO': simular_cache_FIFO,
+        'LRU': simular_cache_LRU,
+        'LFU': simular_cache_LFU,
+        'Random': simular_cache_RANDOM
+    }
+
+    cache_lines = tamanho_cache // bloco_tamanho
+    all_results = {}
+
+    # -------------------------------
+    # Execução Monte Carlo real
+    # -------------------------------
+    for nome, funcao in algos.items():
+        print(f"\nRodando {nome}...")
+
+        taxas = []
+        for _ in range(n_runs):
+            padrao = gerar_padrao_realista(
+                acessos, memory_size,
+                regioes_quentes,
+                prob_temporal, prob_espacial, prob_quente,
+                bloco_tamanho
+            )
+            _, hit_log = funcao(padrao, cache_lines, associatividade, bloco_tamanho)
+            taxas.append(sum(hit_log) / len(hit_log))
+
+        all_results[nome] = taxas
+        print(f"{nome}: média = {np.mean(taxas):.4f} | variância = {np.var(taxas):.6f}")
+
+    # -------------------------------
+    # Geração de Histogramas
+    # -------------------------------
+    plt.figure(figsize=(12, 8))
+    for i, (nome, taxas) in enumerate(all_results.items(), 1):
+        plt.subplot(2, 2, i)
+        plt.hist(taxas, bins=15)
+        plt.title(nome)
+        plt.xlabel("Hit Rate")
+        plt.ylabel("Frequência")
+
+    plt.tight_layout()
+    plt.savefig("atividade4_histogramas.png", dpi=200)
+    plt.show()
+
+    # -------------------------------
+    # Boxplot Comparativo
+    # -------------------------------
+    plt.figure(figsize=(8, 6))
+    plt.boxplot(
+        [all_results[n] for n in all_results.keys()],
+        labels=list(all_results.keys())
+    )
+    plt.ylabel("Hit Rate")
+    plt.title("Monte Carlo — Comparação entre Algoritmos")
+    plt.grid(True, axis='y')
+
+    plt.savefig("atividade4_boxplot.png", dpi=200)
+    plt.show()
+
+    # -------------------------------
+    # Salvar CSV
+    # -------------------------------
+    with open("atividade4_montecarlo.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(list(all_results.keys()))
+        for i in range(n_runs):
+            writer.writerow([all_results[k][i] for k in all_results.keys()])
+
+    print("\nATIVIDADE 4 concluída!")
+    print("Arquivos gerados:")
+    print(" - atividade4_montecarlo.csv")
+    print(" - atividade4_histogramas.png")
+    print(" - atividade4_boxplot.png\n")
+
 # ------------------------------------------------------------------------------
+# Variável global que armazena o algoritmo de substituição selecionado
+algoritmo_escolhido = "FIFO"
 
-def reset_animacao_state():
-    global anim_state
-    anim_state['padrao'] = gerar_padrao_com_rw(100, 256, prob_write=0.4) 
-    anim_state['index'] = 0
-    anim_state['running'] = False
-    anim_state['wt_ram_writes'] = 0
-    anim_state['wb_ram_writes'] = 0
-    anim_state['wb_cache'] = {}
-    anim_state['wt_cache'] = {}
-    
-    if dpg.does_item_exist("anim_progress"):
-        dpg.set_value("anim_progress", 0.0)
-        dpg.set_value("wt_counter", "0")
-        dpg.set_value("wb_counter", "0")
-        dpg.set_value("wt_status", "Pronto")
-        dpg.set_value("wb_status", "Pronto")
-        dpg.configure_item("wt_bus_line", color=(100, 100, 100, 255), thickness=2)
-        dpg.configure_item("wb_bus_line", color=(100, 100, 100, 255), thickness=2)
-
-def update_animation():
-    global anim_state
-    if not anim_state['running']: return
-    if time.time() - anim_state['last_update'] < anim_state['speed']: return
-    anim_state['last_update'] = time.time()
-    
-    idx = anim_state['index']
-    if idx >= len(anim_state['padrao']):
-        anim_state['running'] = False
-        dpg.set_value("wt_status", "Concluído!")
-        dpg.set_value("wb_status", "Concluído!")
-        return
-
-    addr, is_write = anim_state['padrao'][idx]
-    op_str = "ESCRITA (W)" if is_write else "LEITURA (R)"
-    
-    num_blocks = 4
-    tag = addr // num_blocks
-    cache_idx = addr % num_blocks
-    
-    # --- Write-Through ---
-    wt_hit = False
-    wt_msg = f"CPU {op_str} Endereço {addr} -> "
-    
-    if not isinstance(anim_state['wt_cache'], dict): anim_state['wt_cache'] = {}
-    
-    if cache_idx in anim_state['wt_cache'] and anim_state['wt_cache'][cache_idx] == tag:
-        wt_hit = True
-        wt_msg += "HIT na Cache. "
-    else:
-        wt_msg += "MISS. Trazendo da RAM. "
-        anim_state['wt_cache'][cache_idx] = tag
-    
-    bus_active_wt = False
-    if is_write:
-        wt_msg += "Escrevendo na RAM imediatamente!"
-        anim_state['wt_ram_writes'] += 1
-        bus_active_wt = True
-        play_sound_async('WT')
-    else:
-        if not wt_hit: bus_active_wt = True 
-    
-    # --- Write-Back ---
-    wb_hit = False
-    wb_msg = f"CPU {op_str} Endereço {addr} -> "
-    bus_active_wb = False
-    current_block = anim_state['wb_cache'].get(cache_idx)
-    
-    if current_block and current_block['tag'] == tag:
-        wb_hit = True
-        wb_msg += "HIT. "
-        if is_write:
-            current_block['dirty'] = True
-            wb_msg += "Marcando bloco como SUJO."
-    else:
-        wb_msg += "MISS. "
-        if current_block and current_block['dirty']:
-            wb_msg += "Expulsando bloco SUJO -> RAM! "
-            anim_state['wb_ram_writes'] += 1
-            bus_active_wb = True
-            play_sound_async('WB')
-        anim_state['wb_cache'][cache_idx] = {'tag': tag, 'dirty': is_write}
-        if is_write: wb_msg += "Novo bloco marcado como SUJO."
-
-    dpg.set_value("wt_status", wt_msg)
-    dpg.set_value("wb_status", wb_msg)
-    dpg.set_value("wt_counter", str(anim_state['wt_ram_writes']))
-    dpg.set_value("wb_counter", str(anim_state['wb_ram_writes']))
-    dpg.set_value("anim_progress", (idx + 1) / len(anim_state['padrao']))
-    
-    if bus_active_wt: dpg.configure_item("wt_bus_line", color=(255, 255, 0, 255), thickness=6)
-    else: dpg.configure_item("wt_bus_line", color=(50, 50, 50, 255), thickness=2)
-        
-    if bus_active_wb: dpg.configure_item("wb_bus_line", color=(255, 50, 50, 255), thickness=6)
-    else: dpg.configure_item("wb_bus_line", color=(50, 50, 50, 255), thickness=2)
-
-    anim_state['index'] += 1
-
-# ------------------------------------------------------------------------------
-# 5. CALLBACKS (TODOS)
-# ------------------------------------------------------------------------------
-
-def start_anim_callback(sender, app_data):
-    if anim_state['index'] >= len(anim_state['padrao']): reset_animacao_state()
-    anim_state['running'] = True
-
-def pause_anim_callback(sender, app_data): 
-    anim_state['running'] = False
-
-def reset_anim_callback(sender, app_data): 
-    reset_animacao_state()
-
-def update_speed_callback(sender, app_data):
-    val = dpg.get_value(sender)
-    anim_state['speed'] = 1.0 / (val if val > 0 else 1)
-
+# Callback para seleção do algoritmo via GUI
 def selecionar_algoritmo(sender, app_data):
     global algoritmo_escolhido
     algoritmo_escolhido = app_data
 
-def limpar_plots(sender, app_data):
+# ------------------------------------------------------------------------------
+# Geração de mapa de calor (heatmap) dos acessos por bloco ao longo do tempo
+def mapa_temporal_blocos(padrao_acesso, memory_size, bloco_tamanho, resolucao_temporal=100):
+    num_janelas = len(padrao_acesso) // resolucao_temporal
+    num_blocos = memory_size // bloco_tamanho
+    heatmap = np.zeros((num_blocos, num_janelas), dtype=int)
+
+    for i, endereco in enumerate(padrao_acesso):
+        tempo = i // resolucao_temporal
+        bloco = endereco // bloco_tamanho
+        if bloco < num_blocos and tempo < num_janelas:
+            heatmap[bloco][tempo] += 1
+
+    plt.figure(figsize=(10, 4))
+    plt.imshow(heatmap, cmap='hot', aspect='auto', origin='lower')
+    plt.colorbar(label="Número de acessos por bloco")
+    plt.title("Evolução dos Acessos à Memória por Bloco")
+    plt.xlabel(f"Grupos de {resolucao_temporal} Acessos")
+    plt.ylabel("Bloco de Memória")
+    plt.show()
+    
+       
+def calcular_amat(hit_log, hit_time=1, miss_penalty=50):
+    acessos = len(hit_log)
+    hits = sum(hit_log)
+    misses = acessos - hits
+    miss_rate = misses / acessos
+    amat = hit_time + miss_rate * miss_penalty
+    return amat, miss_rate, hits, misses
+ 
+
+# ------------------------------------------------------------------------------
+# Execução de várias simulações (Monte Carlo) para avaliar desempenho do algoritmo escolhido
+def simulacao_monte_carlo(n_simulacoes, acessos, memory_size, cache_lines, associatividade, regioes_quentes, probs, bloco_tamanho):
+    taxas_acerto = []
+    hits_totais = []
+    misses_totais = []
+
+    for i in range(n_simulacoes):
+        padrao = gerar_padrao_realista(acessos, memory_size, regioes_quentes, *probs, bloco_tamanho)
+        
+        # Seleciona e executa o algoritmo de substituição
+        if algoritmo_escolhido == 'FIFO':
+            conjunto_log, hit_log = simular_cache_FIFO(padrao, cache_lines, associatividade, bloco_tamanho)
+        elif algoritmo_escolhido == 'LRU':
+            conjunto_log, hit_log = simular_cache_LRU(padrao, cache_lines, associatividade, bloco_tamanho)
+        elif algoritmo_escolhido == 'LFU':
+            conjunto_log, hit_log = simular_cache_LFU(padrao, cache_lines, associatividade, bloco_tamanho)
+        elif algoritmo_escolhido == 'Random':
+            conjunto_log, hit_log = simular_cache_RANDOM(padrao, cache_lines, associatividade, bloco_tamanho)
+        else:
+            raise ValueError(f"Algoritmo de substituição desconhecido: {algoritmo_escolhido}")
+
+        hits = sum(hit_log)
+        misses = len(hit_log) - hits
+        taxa_acerto = hits / len(hit_log)
+        amat, miss_rate, hits, misses = calcular_amat(hit_log)
+
+        print(f"Hit Rate: {taxa_acerto:.4f}")
+        print(f"Miss Rate: {miss_rate:.4f}")
+        print(f"AMAT: {amat:.2f} ciclos\n")
+
+        
+        
+        # Armazena resultados desta simulação
+        taxas_acerto.append(taxa_acerto)
+        hits_totais.append(hits)
+        misses_totais.append(misses)
+
+
+    # Exibe estatísticas gerais
+    print(f"--- Resultados: {acessos} Acessos - Bloco de {bloco_tamanho} ---\n")
+    print(f"Média da Taxa de Acerto: {np.mean(taxas_acerto):.2f}")
+    print(f"Desvio Padrão da Taxa de Acerto: {np.std(taxas_acerto):.2f}")
+    print(f"Máximo: {max(taxas_acerto):.2f}, Mínimo: {min(taxas_acerto):.2f}")
+
+    # Parte do plot do mapa de acessos. COmentada porque NÃO FUNCIONA!!!!!
+        # if i == 0:
+            # mapa_temporal_blocos(padrao, memory_size, bloco_tamanho, resolucao_temporal=100)
+
+    print(f"--- Resultados: {acessos} Acessos - Bloco de {bloco_tamanho} ---\n")
+    print(f"Média da Taxa de Acerto: {np.mean(taxas_acerto):.4f}")
+    print(f"Desvio padrão da Taxa de Acerto: {np.std(taxas_acerto):.4f}\n")   # print(f"Total médio de acessos: {acessos}")
+ 
+   
+    # Parte comentada ANTIGA para debug!!!!!
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+    # print(f"Média de Cache Hits: {np.mean(hits_totais):.2f}")
+    # print(f"Variância Taxa de Acerto: {np.var(hits_totais):.2f}")
+    # print(f"Média Taxa de Erro: {np.mean(misses_totais):.2f}")
+    # print(f"Variância Taxa de Erro: {np.var(misses_totais):.2f}")
+    # print(f"Média da Taxa de Acerto: {np.mean(taxas_acerto):.4f}")
+    # print(f"Desvio padrão da Taxa de Acerto: {np.std(taxas_acerto):.4f}\n")
+	
+	# Atualiza o conteúdo da caixa de texto 'Resumo' na interface
+	# ATENÇÃO: Após a alteração de desvio da saída padrão (DPGRedirector), tanto faz usar a 
+	# caixa de texto 'Resumo' ou a função 'print'
+	
+    # Texto = f"Total de acessos: {acessos}\n"
+    # Texto += f"Média de Cache Hits: {np.mean(hits_totais):.2f}\n"
+    # Texto += f"Variância de Cache Hits: {np.var(hits_totais):.2f}\n"
+    # Texto += f"Média de Cache Misses: {np.mean(misses_totais):.2f}\n"
+    # Texto += f"Variância de Cache Misses: {np.var(misses_totais):.2f}\n"
+    # Texto += f"Média da Taxa de Acerto: {np.mean(taxas_acerto):.4f}\n"
+    # Texto += f"Desvio padrão da Taxa de Acerto: {np.std(taxas_acerto):.4f}\n"
+	
+    # Atualiza dados da simulação na Caixa de tetxto Resumo
+    # dpg.set_value("Resumo", Texto)
+    return np.mean(taxas_acerto)
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+
+import dearpygui.dearpygui as dpg
+
+from collections import deque
+
+resultados = []
+
+
+def rodar_simulacao_callback():
+    start_time = time.time()
+    print(f"            ---   Algoritmo: {algoritmo_escolhido} ---\n")
+    global resultados
+    dpg.set_value("mensagem_erro", "")  # Limpa mensagem antiga
+
+    try:
+        # Leitura dos valores
+        memory_size = dpg.get_value("memory_size")
+        acessos = dpg.get_value("acessos")
+        tamanho_cache_bytes = dpg.get_value("tamanho_cache")
+        associatividade = dpg.get_value("associatividade")
+        n_simulacoes = dpg.get_value("n_simulacoes")
+        prob_temporal = dpg.get_value("prob_temporal")
+        prob_espacial = dpg.get_value("prob_espacial")
+        prob_quente = dpg.get_value("prob_quente")
+        blocos = dpg.get_value("blocos")
+        blocos = [int(b.strip()) for b in blocos.split(",")]
+
+        regioes_quentes = [
+            64, 1024, 8192, 32768, 131072, 262144, 524288, 786432, 983040
+        ]
+
+        # --- VERIFICAÇÕES ---
+
+        if not (2**20 <= memory_size <= 2**30) or (memory_size & (memory_size-1)) != 0:
+            dpg.set_value("mensagem_erro", "Erro: Memory Size deve ser potência de 2 entre 2^20 e 2^30.")
+            return
+
+        if not is_power_of_two(associatividade):
+            dpg.set_value("mensagem_erro", "Erro: Associatividade deve ser potência de 2 maior que zero.")
+            return
+
+        if (tamanho_cache_bytes & (tamanho_cache_bytes-1)) != 0 or tamanho_cache_bytes >= memory_size:
+            dpg.set_value("mensagem_erro", "Erro: Tamanho da Cache deve ser potência de 2 e menor que Memory Size.")
+            return
+
+        for bloco in blocos:
+            if bloco <= 0 or bloco >= memory_size or not is_power_of_two(bloco):
+                dpg.set_value("mensagem_erro", f"Tamanho do Bloco deve ser potência de 2 e menor que Memory Size. Valor fornecido: {bloco}")
+                return
+            cache_lines = tamanho_cache_bytes // bloco
+            num_conjuntos = cache_lines // associatividade
+            if num_conjuntos < 1:
+                dpg.set_value("mensagem_erro", f"Erro: Associatividade {associatividade} inválida para bloco {bloco}.")
+                return
+
+        if not (0 <= prob_temporal <= 1) or not (0 <= prob_espacial <= 1) or not (0 <= prob_quente <= 1):
+            dpg.set_value("mensagem_erro", "Erro: Probabilidades devem ser entre 0 e 1.")
+            return
+        
+        
+
+        # --- FIM VERIFICAÇÕES ---
+
+        resultados.clear()
+        contador_barra = 0
+        progresso = 0.01		# Mostra um andamento mínimo na barra de progresso para indicar que a nova simulação iniciou
+        dpg.set_value("barra", progresso)
+        dpg.set_value("texto", "Simulação Iniciada")
+        for bt in blocos:
+            contador_barra += 1		
+            progresso = contador_barra / len(blocos)            
+            cache_lines = tamanho_cache_bytes // bt
+            taxas_acerto = simulacao_monte_carlo(
+                n_simulacoes,
+                acessos,
+                memory_size,
+                cache_lines,
+                associatividade,
+                regioes_quentes,
+                (prob_temporal, prob_espacial, prob_quente),
+                bt
+            )
+            dpg.set_value("barra", progresso)
+            dpg.set_value("texto", f"{int(progresso*100)}% concluído")
+            resultados.append((bt, taxas_acerto))
+            dpg.split_frame()  # Permite que a interface atualize
+		# ao final, exibir resultados
+        atualizar_plot()
+
+        if resultados:
+            tamanhos, taxas = zip(*resultados)
+            texto = f"Tamanhos_de_bloco = [{', '.join(str(int(t)) for t in tamanhos)}];\n"
+            texto += f"Taxa_media_de_acerto = [{', '.join(f'{float(t):.6f}' for t in taxas)}];"
+        
+            # Atualiza o conteúdo da caixa de texto na interface
+            dpg.set_value("resultados_box", texto)
+        
+            # Opcional: também salva os resultados em um arquivo CSV
+            
+			# Define o nome da subpasta
+            subpasta = "Resultados da Simulacao"
+			# Cria a subpasta se não existir
+            os.makedirs(subpasta, exist_ok=True)
+            # Captura data e hora atual
+            agora = datetime.now()
+            # Formata para uma string segura para nome de arquivo
+            timestamp = agora.strftime("%Y-%m-%d_%H-%M-%S")
+			# Caminho completo do arquivo
+            nome_arquivo = f"Resultados da Simulacao - {timestamp}.csv"
+            caminho_arquivo = os.path.join(subpasta, nome_arquivo)
+            with open(caminho_arquivo, "w") as f:
+                f.write(f"- Algoritmo = {algoritmo_escolhido}\n- Associatividade = {associatividade}\n- Acessos = {acessos}\n- Cache = {tamanho_cache_bytes}\n- P_tem = {prob_temporal}\n- P_espa = {prob_espacial}\n- P_reg_quente = {prob_quente}\n")
+                f.write("\nTamanho_Bloco,Taxa_Acerto\n")
+                for bloco, taxa in resultados:
+                    f.write(f"{bloco},{taxa:.6f}\n")
+                    
+    
+    except Exception as e:
+        dpg.set_value("mensagem_erro", f"Erro inesperado: {str(e)}")
+    # Mede tempo de simulação:
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Tempo de execução: {elapsed_time:.2f} segundos\n")
+    print("          ------------++-------------     \n")
+  
+
+# Limpa plots e elementos graficos (barra e caixas de texto)
+def limpar_plots():
     global plot_series_tags
-    for t in plot_series_tags:
-        if dpg.does_item_exist(t): dpg.delete_item(t)
-    plot_series_tags.clear()
+    plot_series_tags = []
+    dpg.delete_item("y_axis", children_only=True)
     dpg.set_value("barra", 0.0)
-    dpg.set_value("Resumo", "") # Limpa também o texto
+    dpg.set_value("texto", f"0% concluído")
+    dpg.set_value("Resumo", "\n")
+    dpg.set_value("resultados_box", "\n")
+    dpg.set_value("mensagem_erro", " ")
 
-def limpar_ultimo_plot(sender, app_data):
+def limpar_ultimo_plot():
     global plot_series_tags
+    # Limpa dados da simulação na Caixa de tetxto Resumo		        
+    # dpg.set_value("Resumo", "\n")
+    dpg.set_value("mensagem_erro", " ")
+    dpg.set_value("barra", 0.0)
+    dpg.set_value("texto", f"0% concluído")
+    dpg.set_value("resultados_box", "\n")		
     if plot_series_tags:
-        t = plot_series_tags.pop()
-        if dpg.does_item_exist(t): dpg.delete_item(t)
+        ultimo_tag = plot_series_tags.pop()
+        dpg.delete_item(ultimo_tag)
+        print(f"Apagado: {ultimo_tag}")
 
-def limpar_heatmap(sender, app_data):
-    if dpg.does_item_exist("heatmap_image"): dpg.delete_item("heatmap_image")
-    if dpg.does_item_exist("heatmap_text"): dpg.delete_item("heatmap_text")
+import math
+def atualizar_plot():
+    global plot_series_tags
+    if not dpg.does_item_exist("y_axis"):
+        print("Erro: 'y_axis' não existe.")
+        return
 
-def close_callback(sender, app_data):
-    dpg.stop_dearpygui()
+    # dpg.delete_item("plot_series", children_only=True)
+    tamanhos, taxas = zip(*resultados)
 
-def mapa_temporal_blocos_global(sender, app_data):
-    try:
-        mem = int(dpg.get_value("memory_size"))
-        bloco = int(dpg.get_value("blocos").split(",")[0])
-        acessos = int(dpg.get_value("acessos"))
-        
-        regioes = [64, 1024, 8192, 32768]
-        padrao = gerar_padrao_realista(acessos, mem, regioes, 0.3, 0.3, 0.4, bloco)
-        
-        res_temp = 100
-        num_janelas = max(1, len(padrao) // res_temp)
-        res_blocos = 256
-        num_blocos = max(1, mem // bloco)
-        num_blocos_agrup = max(1, num_blocos // res_blocos)
-        
-        heatmap = np.zeros((num_blocos_agrup, num_janelas), dtype=int)
-        
-        for i, addr in enumerate(padrao):
-            t = min(i // res_temp, num_janelas - 1)
-            b = addr // bloco
-            b_agrup = min(b // res_blocos, num_blocos_agrup - 1)
-            heatmap[b_agrup][t] += 1
-            
-        plt.figure(figsize=(6, 4))
-        plt.imshow(heatmap, cmap='hot', aspect='auto', origin='lower', interpolation='nearest')
-        plt.colorbar(label="Acessos")
-        plt.title(f"Heatmap (Bloco: {bloco}B)")
-        plt.xlabel("Tempo")
-        plt.ylabel("Bloco Memória")
-        plt.tight_layout()
-        
-        if not os.path.exists('Heatmaps'): os.makedirs('Heatmaps')
-        fn = f'Heatmaps/heatmap_{datetime.now().strftime("%H%M%S")}.png'
-        plt.savefig(fn, dpi=100, bbox_inches='tight')
-        plt.close()
-        
-        if dpg.does_item_exist("heatmap_texture"): dpg.delete_item("heatmap_texture")
-        w, h, c, data = dpg.load_image(fn)
-        with dpg.texture_registry():
-            dpg.add_static_texture(w, h, data, tag="heatmap_texture")
-            
-        if dpg.does_item_exist("heatmap_image"):
-            dpg.delete_item("heatmap_image")
-            dpg.delete_item("heatmap_text")
-            
-        dpg.add_image("heatmap_texture", parent="heatmap_group", tag="heatmap_image", width=540, height=450)
-        dpg.add_text(f"Visualizando Bloco: {bloco} bytes", parent="heatmap_group", tag="heatmap_text")
-        
-    except Exception as e:
-        print(f"Erro heatmap: {str(e)}")
+    # Calcula log2 dos tamanhos
+    tamanhos_log2 = [math.log2(tam) for tam in tamanhos]
 
-def rodar_simulacao_aba1(sender, app_data):
-    try:
-        mem = dpg.get_value("memory_size")
-        acs = dpg.get_value("acessos")
-        c_size = dpg.get_value("tamanho_cache")
-        assoc = dpg.get_value("associatividade")
-        n_sim = dpg.get_value("n_simulacoes")
-        blocos = [int(x) for x in dpg.get_value("blocos").split(",")]
-        probs = (dpg.get_value("prob_temporal"), dpg.get_value("prob_espacial"), dpg.get_value("prob_quente"))
-        algo = dpg.get_value("combo_algoritmo")
-        reg = [64, 1024, 8192, 32000]
+    # Verifica consistência
+    if len(tamanhos_log2) != len(taxas):
+        print("Erro: tamanhos_log2 e taxas têm tamanhos diferentes")
+        return
 
-        res_aba1 = []
-        dpg.set_value("barra", 0.0)
-        
-        start_t = time.time()
-        print(f"\n--- Iniciando Simulação: {algo} ---") # LOG INICIAL
-        
-        for i, b in enumerate(blocos):
-            lines = c_size // b
-            taxa = simulacao_monte_carlo(n_sim, acs, mem, lines, assoc, reg, probs, b, algo)
-            res_aba1.append((b, taxa))
-            dpg.set_value("barra", (i+1)/len(blocos))
-            dpg.split_frame()
-            
-        print(f"Tempo total: {time.time()-start_t:.2f}s\n") # LOG FINAL
-            
-        global plot_series_tags
-        tag = f"plot1_{len(plot_series_tags)}"
-        plot_series_tags.append(tag)
-        x, y = zip(*res_aba1)
-        x_log = [math.log2(v) for v in x]
-        dpg.add_line_series(x_log, list(y), label=f"{algo}", parent="y_axis", tag=tag)
-        dpg.fit_axis_data("x_axis")
-        dpg.fit_axis_data("y_axis")
-        dpg.set_value("resultados_box", f"Resultados Finais: {list(zip(x, [round(v,3) for v in y]))}")
-    except Exception as e:
-        print(f"Erro simulação: {e}")
+    # dpg.set_axis_limits("x_axis", min(tamanhos_log2), max(tamanhos_log2))
+    # dpg.set_axis_limits("y_axis", min(taxas), max(taxas))
+    plot_series = f"plot_{len(plot_series_tags)}"
+    print(f"\nPlot Atual: {plot_series}\n")
+    plot_series_tags.append(plot_series)
+    dpg.add_line_series(
+        tamanhos_log2,
+        taxas,
+        label=f"{algoritmo_escolhido}",
+        parent="y_axis",
+        tag=plot_series,
+		show=True
+    )
+    dpg.fit_axis_data("x_axis")
+    dpg.fit_axis_data("y_axis")
 
-def rodar_simulacao_multinivel_callback(sender, app_data):
-    try:
-        mem_size = dpg.get_value("memory_size_multi")
-        acessos = dpg.get_value("acessos_multi")
-        n_sim = dpg.get_value("n_simulacoes_multi")
-        bloco = dpg.get_value("bloco_multi")
-        
-        niveis = []
-        algos = []
-        tempos = []
-        
-        niveis.append((dpg.get_value("tamanho_cache_l1")//bloco, dpg.get_value("associatividade_l1"), bloco))
-        algos.append(dpg.get_value("algoritmo_l1"))
-        tempos.append(dpg.get_value("tempo_l1"))
-        
-        if dpg.get_value("usar_l2"):
-            niveis.append((dpg.get_value("tamanho_cache_l2")//bloco, dpg.get_value("associatividade_l2"), bloco))
-            algos.append(dpg.get_value("algoritmo_l2"))
-            tempos.append(dpg.get_value("tempo_l2"))
-            
-        if dpg.get_value("usar_l3"):
-            niveis.append((dpg.get_value("tamanho_cache_l3")//bloco, dpg.get_value("associatividade_l3"), bloco))
-            algos.append(dpg.get_value("algoritmo_l3"))
-            tempos.append(dpg.get_value("tempo_l3"))
-        
-        tempos.append(dpg.get_value("tempo_ram"))
-        probs = (dpg.get_value("prob_temporal_multi"), dpg.get_value("prob_espacial_multi"), dpg.get_value("prob_quente_multi"))
-        regioes = [64, 1024, 8192, 32768, 131072]
-        
-        hit_rates, t_medio = simulacao_monte_carlo_multinivel_wrapper(n_sim, acessos, mem_size, niveis, algos, tempos, regioes, probs, bloco)
-        
-        msg = f"--- Resultados Multinível ---\nHit Rates (L1, L2...): {hit_rates}\nTempo Médio de Acesso: {t_medio:.2f} ns"
-        dpg.set_value("resultados_box_multi", msg)
-        
-    except Exception as e:
-        dpg.set_value("resultados_box_multi", f"Erro: {str(e)}")
 
-# ------------------------------------------------------------------------------
-# 6. CONSTRUÇÃO DA GUI (MAIN)
-# ------------------------------------------------------------------------------
+# Interface
+dpg.create_context()
+sys.stdout = DPGRedirector("Resumo")  # Redireciona todos os prints
 
-if __name__ == "__main__":
-    dpg.create_context()
+# Pega a resolução da tela
+# viewport_width, viewport_height = dpg.get_viewport_client_width(), dpg.get_viewport_client_height()
+
+
+with dpg.window(label="Simulação de Cache", width=1400, height=900):
+    dpg.add_input_int(label="Memory Size", default_value=1048576, tag="memory_size", width=200)
+    dpg.add_input_int(label="Acessos", default_value=10000, tag="acessos", width=200)
+    dpg.add_input_int(label="Tamanho Cache (Bytes)", default_value=8192, tag="tamanho_cache", width=200)
+    dpg.add_input_int(label="Associatividade", default_value=16, tag="associatividade", width=200)
+    dpg.add_input_int(label="N Simulações", default_value=10, tag="n_simulacoes", width=200)
     
-    with dpg.window(label="Simulador de Cache Educacional", tag="Primary Window"):
-        with dpg.tab_bar(tag="tab_bar"):
-            
-            # --- ABA 1: CACHE ÚNICA ---
-            with dpg.tab(label="Cache Única", tag="cache_unica_tab"):
-                
-                # PARTE SUPERIOR: INPUTS
-                dpg.add_input_int(label="Memory Size", default_value=1048576, tag="memory_size", width=200)
-                dpg.add_input_int(label="Acessos", default_value=10000, tag="acessos", width=200)
-                dpg.add_input_int(label="Tamanho Cache (Bytes)", default_value=4096, tag="tamanho_cache", width=200)
-                dpg.add_input_int(label="Associatividade", default_value=4, tag="associatividade", width=200)
-                dpg.add_input_int(label="N Simulações", default_value=5, tag="n_simulacoes", width=200)
-                dpg.add_separator()
-                dpg.add_input_float(label="Prob. Temporal", default_value=0.3, tag="prob_temporal", width=200)
-                dpg.add_input_float(label="Prob. Espacial", default_value=0.3, tag="prob_espacial", width=200)
-                dpg.add_input_float(label="Prob. Quente", default_value=0.3, tag="prob_quente", width=200)
-                dpg.add_separator()
-                dpg.add_input_text(label="Tamanhos de Bloco", default_value="2,4,8,16,32,64,128,256,512", tag="blocos", width=400)
-                dpg.add_separator()
-
-                # BARRA DE BOTÕES
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="Simular", callback=rodar_simulacao_aba1)
-                    dpg.add_button(label="Simular Multinível (Ir p/ Aba 2)", callback=lambda: dpg.set_value(dpg.get_item_alias("tab_bar"), "cache_multinivel_tab")) 
-                    dpg.add_button(label="Limpar Último", callback=limpar_ultimo_plot)
-                    dpg.add_button(label="Limpar Plots", callback=limpar_plots)
-                    dpg.add_button(label="Gerar Heatmap", callback=mapa_temporal_blocos_global) 
-                    dpg.add_button(label="Limpar Heatmap", callback=limpar_heatmap)
-                    dpg.add_button(label="Sair", callback=close_callback)
-                    dpg.add_progress_bar(tag="barra", default_value=0.0, width=250)
-                    dpg.add_text("0%", tag="texto")
-                    dpg.add_combo(items=["FIFO", "LRU", "LFU", "Random"], default_value='FIFO', label="<-- Algoritmo", width=100, tag="combo_algoritmo",callback=selecionar_algoritmo)
-                
-                dpg.add_separator()
-                dpg.add_input_text(label="<-- Resultado da Última Simulação", multiline=True, readonly=True, height=35, tag="resultados_box")
-                dpg.add_text("", tag="mensagem_erro", color=(255, 100, 100))
-                dpg.add_separator()
-
-                # ÁREA INFERIOR: GRÁFICOS
-                with dpg.group(horizontal=True):
-                    with dpg.plot(label="Taxa de acerto vs Tamanho do Bloco", tag="plot", height=380, width=600):
-                        dpg.add_plot_legend()
-                        dpg.add_plot_axis(dpg.mvXAxis, label="Tamanho do Bloco", tag="x_axis")
-                        dpg.add_plot_axis(dpg.mvYAxis, label="Taxa de Acerto", tag="y_axis")
-                    
-                    # Coluna da direita: Log + Heatmap
-                    with dpg.group():
-                        dpg.add_input_text(label="<-- Resumo", multiline=True, readonly=True, height=380, width=360, tag="Resumo")
-                        with dpg.group(tag="heatmap_group"):
-                            dpg.add_text("Mapa de Calor (Gerado aqui)")
-
-            # --- ABA 2: MULTINÍVEL ---
-            with dpg.tab(label="Multinível", tag="cache_multinivel_tab"):
-                with dpg.group(horizontal=True):
-                    with dpg.group(width=350):
-                        dpg.add_text("Configurações Multinível", color=(255, 200, 100))
-                        dpg.add_input_int(label="Memory Size", default_value=16777216, tag="memory_size_multi", width=150)
-                        dpg.add_input_int(label="Acessos", default_value=50000, tag="acessos_multi", width=150)
-                        dpg.add_input_int(label="N Simulações", default_value=5, tag="n_simulacoes_multi", width=150)
-                        dpg.add_separator()
-                        
-                        dpg.add_text("L1 Cache")
-                        dpg.add_input_int(label="Tam L1", default_value=32768, tag="tamanho_cache_l1", width=150)
-                        dpg.add_input_int(label="Assoc L1", default_value=8, tag="associatividade_l1", width=150)
-                        dpg.add_combo(items=["FIFO", "LRU", "LFU", "Random"], default_value='LRU', tag="algoritmo_l1", width=150)
-                        dpg.add_input_int(label="Tempo L1", default_value=1, tag="tempo_l1", width=150)
-                        dpg.add_separator()
-                        
-                        dpg.add_checkbox(label="Usar L2", default_value=True, tag="usar_l2")
-                        dpg.add_input_int(label="Tam L2", default_value=262144, tag="tamanho_cache_l2", width=150)
-                        dpg.add_input_int(label="Assoc L2", default_value=8, tag="associatividade_l2", width=150)
-                        dpg.add_combo(items=["FIFO", "LRU", "LFU", "Random"], default_value='LRU', tag="algoritmo_l2", width=150)
-                        dpg.add_input_int(label="Tempo L2", default_value=10, tag="tempo_l2", width=150)
-                        dpg.add_separator()
-                        
-                        dpg.add_checkbox(label="Usar L3", default_value=True, tag="usar_l3")
-                        dpg.add_input_int(label="Tam L3", default_value=2097152, tag="tamanho_cache_l3", width=150)
-                        dpg.add_input_int(label="Assoc L3", default_value=16, tag="associatividade_l3", width=150)
-                        dpg.add_combo(items=["FIFO", "LRU", "LFU", "Random"], default_value='LRU', tag="algoritmo_l3", width=150)
-                        dpg.add_input_int(label="Tempo L3", default_value=30, tag="tempo_l3", width=150)
-                        dpg.add_separator()
-                        
-                        dpg.add_input_int(label="Tempo RAM", default_value=200, tag="tempo_ram", width=150)
-                        dpg.add_input_float(label="Prob Temporal", default_value=0.3, tag="prob_temporal_multi", width=150)
-                        dpg.add_input_float(label="Prob Espacial", default_value=0.3, tag="prob_espacial_multi", width=150)
-                        dpg.add_input_float(label="Prob Quente", default_value=0.3, tag="prob_quente_multi", width=150)
-                        dpg.add_input_int(label="Tam Bloco", default_value=64, tag="bloco_multi", width=150)
-                        
-                        dpg.add_spacer(height=20)
-                        dpg.add_button(label="RODAR SIMULAÇÃO MULTINÍVEL", callback=rodar_simulacao_multinivel_callback, width=300, height=50)
-
-                    with dpg.group():
-                        dpg.add_text("Resultados da Simulação Multinível:")
-                        dpg.add_input_text(tag="resultados_box_multi", multiline=True, width=600, height=400, readonly=True)
-
-            # --- ABA 3: ANIMAÇÃO ---
-            with dpg.tab(label="Simulação Métodos de Escrita"):
-                dpg.add_text("Comparação Visual: Write-Through vs Write-Back", color=(100, 255, 100))
-                dpg.add_text("Observe o barramento (linha) conectando Cache à RAM.")
-                
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="> INICIAR", callback=start_anim_callback, width=150)
-                    dpg.add_button(label="|| PAUSAR", callback=pause_anim_callback, width=100)
-                    dpg.add_button(label="[] REINICIAR", callback=reset_anim_callback, width=100)
-                    dpg.add_text(" Velocidade:")
-                    dpg.add_slider_float(default_value=10, min_value=1, max_value=100, width=150, callback=update_speed_callback)
-                
-                dpg.add_progress_bar(tag="anim_progress", default_value=0.0, width=600)
-                dpg.add_spacer(height=20)
-                
-                with dpg.drawlist(width=800, height=400, tag="canvas_anim"):
-                    # WT
-                    dpg.draw_text((20, 20), "CENÁRIO A: WRITE-THROUGH (Imediata)", color=(255, 255, 0), size=20)
-                    dpg.draw_rectangle((50, 60), (150, 140), color=(100, 200, 255), thickness=3) 
-                    dpg.draw_text((70, 90), "CPU", size=20)
-                    dpg.draw_rectangle((250, 60), (350, 140), color=(100, 255, 100), thickness=3) 
-                    dpg.draw_text((260, 90), "CACHE", size=18)
-                    dpg.draw_rectangle((550, 60), (650, 140), color=(255, 100, 255), thickness=3) 
-                    dpg.draw_text((570, 90), "RAM", size=20)
-                    dpg.draw_line((150, 100), (250, 100), color=(255, 255, 255), thickness=2)
-                    dpg.draw_line((350, 100), (550, 100), color=(50, 50, 50), thickness=2, tag="wt_bus_line")
-                    dpg.draw_text((400, 70), "Barramento", size=15)
-                    
-                    # WB
-                    dpg.draw_text((20, 220), "CENÁRIO B: WRITE-BACK (Posterior)", color=(255, 100, 100), size=20)
-                    dpg.draw_rectangle((50, 260), (150, 340), color=(100, 200, 255), thickness=3)
-                    dpg.draw_text((70, 290), "CPU", size=20)
-                    dpg.draw_rectangle((250, 260), (350, 340), color=(100, 255, 100), thickness=3)
-                    dpg.draw_text((260, 290), "CACHE", size=18)
-                    dpg.draw_rectangle((550, 260), (650, 340), color=(255, 100, 255), thickness=3)
-                    dpg.draw_text((570, 290), "RAM", size=20)
-                    dpg.draw_line((150, 300), (250, 300), color=(255, 255, 255), thickness=2)
-                    dpg.draw_line((350, 300), (550, 300), color=(50, 50, 50), thickness=2, tag="wb_bus_line")
-
-                with dpg.group(horizontal=True):
-                    with dpg.group():
-                        dpg.add_text("Status WT:", color=(255, 255, 0))
-                        dpg.add_text("Pronto", tag="wt_status", wrap=350)
-                        dpg.add_spacer(height=10)
-                        dpg.add_text("ESCRITAS NA RAM (Custo):")
-                        dpg.add_text("0", tag="wt_counter", color=(255, 255, 0))
-                    dpg.add_spacer(width=50)
-                    with dpg.group():
-                        dpg.add_text("Status WB:", color=(255, 100, 100))
-                        dpg.add_text("Pronto", tag="wb_status", wrap=350)
-                        dpg.add_spacer(height=10)
-                        dpg.add_text("ESCRITAS NA RAM (Custo):")
-                        dpg.add_text("0", tag="wb_counter", color=(255, 100, 100))
-
-    dpg.create_viewport(title='Simulador de Cache', width=1300, height=900)
-    dpg.set_primary_window("Primary Window", True)
-    dpg.setup_dearpygui()
-    dpg.show_viewport()
+    dpg.add_separator()
+    dpg.add_input_float(label="Probabilidade Temporal", default_value=0.2, tag="prob_temporal", width=200)
+    dpg.add_input_float(label="Probabilidade Espacial", default_value=0.2, tag="prob_espacial", width=200)
+    dpg.add_input_float(label="Probabilidade Região Quente", default_value=0.4, tag="prob_quente", width=200)
     
-    # Redireciona o print para a caixa de texto da Aba 1
-    sys.stdout = DPGRedirector("Resumo")
+    dpg.add_separator()
+    dpg.add_input_text(label="Tamanhos de Bloco", default_value="2,4,8,16,32,64,128,256,512", tag="blocos", width=400)
+
+    with dpg.group(horizontal=True):  # Inicia um grupo horizontal
+        dpg.add_button(label="Simular", callback=rodar_simulacao_callback)
+        dpg.add_button(label="Limpar Último", callback=limpar_ultimo_plot)
+        dpg.add_button(label="Limpar Plots", callback= limpar_plots)
+        dpg.add_progress_bar(tag="barra", default_value=0.0, width=300)
+        dpg.add_text("0% concluído", tag="texto")
+		# Combobox escolha do algoritmo de substituição
+        # dpg.add_text("Algoritmo de Substituição:")		
+        dpg.add_combo(items=["FIFO", "LRU", "LFU", "Random"], default_value='FIFO', label="<-- Algoritmo de Substituição", width=100, tag="combo_algoritmo",callback=selecionar_algoritmo)
+        # Salvar Grafico está com erro!!!
+        # dpg.add_button(label="Salvar Simulação", callback=export_callback)
+        dpg.add_button(label="Mostrar Heatmap", callback=mapa_temporal_blocos)
     
-    while dpg.is_dearpygui_running():
-        update_animation() # Chama a animação a cada frame
-        dpg.render_dearpygui_frame()
+        dpg.add_button(label="Atividade (Monte Carlo Algoritmos)",
+               callback=lambda: atividade4_montecarlo())
+
+
+    dpg.add_separator()
+    dpg.add_input_text(label="<-- Resultado da Última Simulação", multiline=True, readonly=True, height=35, tag="resultados_box")
+	
+    dpg.add_separator()
+    dpg.add_text("", tag="mensagem_erro")
+    dpg.add_separator()
     
-    dpg.destroy_context()
+
+    with dpg.group(horizontal=True):  # Inicia um grupo horizontal
+        with dpg.plot(label="Taxa de acerto vs Tamanho do Bloco", tag="plot", height=380, width=600):
+            dpg.add_plot_legend()
+            x_axis = dpg.add_plot_axis(dpg.mvXAxis, label="Tamanho do Bloco", tag="x_axis")
+            y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="Taxa de Acerto", tag="y_axis")
+        dpg.add_input_text(label="<-- Resumo da Simulação", multiline=True, readonly=True, height=380, width=360, default_value="", tag="Resumo")
+
+
+dpg.create_viewport(title='Simulação de Cache', width=800, height=600)
+dpg.setup_dearpygui()
+dpg.maximize_viewport()
+dpg.show_viewport()
+dpg.start_dearpygui()
+dpg.destroy_context()
+
+
+
+#atividade 2
+
+import csv
+import matplotlib.pyplot as plt
+from cache_simulator_GUI import simular_cache_LRU, gerar_padrao_realista
+
+cache_lines = 8192
+associatividade = 1
+memory_size = 4096
+num_acessos = 10000
+
+padrao = gerar_padrao_realista(num_acessos=num_acessos,
+                               memory_size=memory_size,
+                               prob_temporal=0.1,
+                               prob_espacial=0.7,
+                               prob_quente=0.2,
+                               seed=123)
+
+blocos = [4,8,16,32,64]
+results = []
+for b in blocos:
+    _, hit_log = simular_cache_LRU(padrao, cache_lines, associatividade, b)
+    hit_rate = sum(hit_log)/len(hit_log)
+    results.append((b, hit_rate))
+    print(f"bloco={b}: hit_rate={hit_rate:.4f}")
+
+with open('atividade2_results.csv','w',newline='') as f:
+    w=csv.writer(f)
+    w.writerow(['bloco_tamanho','hit_rate'])
+    w.writerows(results)
+
+bs=[r[0] for r in results]; hr=[r[1] for r in results]
+plt.figure(figsize=(8,5))
+plt.plot(bs, hr, marker='o')
+plt.xlabel('Tamanho do bloco (bytes)')
+plt.ylabel('Hit rate')
+plt.title('Impacto do Tamanho do Bloco (LRU)')
+plt.grid(True)
+plt.savefig('atividade2_bloco_vs_hitrate.png', dpi=200)
+plt.show()
+
+#atividade 4
+
+# atividade4_from_gui.py
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+from cache_simulator_GUI import (
+    simular_cache_FIFO,
+    simular_cache_LRU,
+    simular_cache_LFU,
+    simular_cache_RANDOM,
+    gerar_padrao_realista
+)
+
+cache_lines = 8192
+associatividade = 2
+bloco_tamanho = 8
+memory_size = 4096
+num_acessos = 5000
+n_runs = 100
+
+algos = {
+    'FIFO': simular_cache_FIFO,
+    'LRU': simular_cache_LRU,
+    'LFU': simular_cache_LFU,
+    'Random': simular_cache_RANDOM
+}
+
+all_results = {}
+for name, func in algos.items():
+    rates = []
+    for run in range(n_runs):
+        padrao = gerar_padrao_realista(num_acessos=num_acessos,
+                                       memory_size=memory_size,
+                                       prob_temporal=0.3,
+                                       prob_espacial=0.3,
+                                       prob_quente=0.4,
+                                       seed=None)
+        _, hit_log = func(padrao, cache_lines, associatividade, bloco_tamanho)
+        hit_rate = sum(hit_log) / len(hit_log)
+        rates.append(hit_rate)
+    all_results[name] = rates
+    print(f"{name}: mean={np.mean(rates):.4f}, var={np.var(rates):.6f}")
+
+with open('atividade4_montecarlo.csv', 'w', newline='') as f:
+    writer = csv.writer(f)
+    header = list(all_results.keys())
+    writer.writerow(header)
+    for i in range(n_runs):
+        writer.writerow([all_results[a][i] for a in header])
+
+# HISTOGRAMAS
+plt.figure(figsize=(12,8))
+for i,(name,rates) in enumerate(all_results.items(), 1):
+    plt.subplot(2,2,i)
+    plt.hist(rates, bins=15)
+    plt.title(name)
+    plt.xlabel('Hit rate')
+    plt.ylabel('Frequência')
+plt.tight_layout()
+plt.savefig('atividade4_histogramas.png', dpi=200)
+plt.show()
+
+# BOXPLOT COMPARATIVO
+plt.figure(figsize=(8,6))
+plt.boxplot([all_results[name] for name in all_results.keys()], labels=list(all_results.keys()))
+plt.ylabel('Hit rate')
+plt.title('Boxplot comparativo de algoritmos (Monte Carlo)')
+plt.grid(True, axis='y')
+plt.savefig('atividade4_boxplot.png', dpi=200)
+plt.show()
