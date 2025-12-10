@@ -1,8 +1,4 @@
 # simulador_cache
-Simulador de Memória Cache com Interface Gráfica (GUI)
-Claro! Aqui está a versão revisada e formatada para o arquivo `README.md` de um repositório no GitHub. A linguagem foi ajustada para o estilo típico de documentação pública, mantendo clareza, objetividade e boa organização:
-
----
 
 # Simulador de Memória Cache com Interface Gráfica (GUI)
 
@@ -145,3 +141,5 @@ Este simulador pode ser utilizado em disciplinas como:
 * Simulação de Sistemas
 
 É uma ferramenta simples que pode ser usada para entender conceitos fundamentais de caches, localidade de acesso e impacto das políticas de substituição no desempenho.
+
+=> Observação: o repositório apresenta dois códigos, cada um referente a sua respectiva atividade descrita no relatório do projeto. Rodar o ativ1_3_cache_simulator_GUI.py para as atividades 1 e 3; e o ativ2_4_cache_simulator_GUI.py para as atividades 2 e 4.
