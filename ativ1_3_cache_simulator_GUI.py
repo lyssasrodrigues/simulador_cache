@@ -654,7 +654,7 @@ dpg.destroy_context()
 
 import csv
 import matplotlib.pyplot as plt
-from cache_simulator_GUI import simular_cache_LRU, gerar_padrao_realista
+from ativ1_3_cache_simulator_GUI import simular_cache_LRU, gerar_padrao_realista
 
 cache_lines = 8192
 associatividade = 1
@@ -697,7 +697,7 @@ plt.show()
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
-from cache_simulator_GUI import (
+from ativ1_3_cache_simulator_GUI import (
     simular_cache_FIFO,
     simular_cache_LRU,
     simular_cache_LFU,
